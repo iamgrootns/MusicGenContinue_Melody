@@ -10,6 +10,7 @@ from scipy import signal
 import traceback
 import requests
 import urllib.parse
+from audiocraft.models import MusicGen
 from audiocraft.data.audio import audio_write
 
 # --- Global Variables & Model Loading ---
@@ -19,17 +20,16 @@ model = None
 try:
     if os.path.exists(INIT_ERROR_FILE):
         os.remove(INIT_ERROR_FILE)
-        
+
     print("Loading MusicGen melody model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    
-    from audiocraft.models import MusicGen
+
     model = MusicGen.get_pretrained("melody", device=device)
     model.set_generation_params(duration=30)
     print("Melody model loaded successfully.")
 
-except Exception as e:
+except Exception:
     tb_str = traceback.format_exc()
     with open(INIT_ERROR_FILE, "w") as f:
         f.write(f"Failed to initialize melody model: {tb_str}")
@@ -54,7 +54,11 @@ def upsample_audio(input_wav_bytes, target_sr=48000):
 
 def upload_to_gcs(signed_url, audio_bytes, content_type="audio/wav"):
     try:
-        response = requests.put(signed_url, data=audio_bytes, headers={"Content-Type": content_type}, timeout=300)
+        response = requests.put(
+            signed_url, data=audio_bytes,
+            headers={"Content-Type": content_type},
+            timeout=300
+        )
         response.raise_for_status()
         print(f"Uploaded to GCS: {signed_url[:100]}...")
         return True
@@ -66,11 +70,13 @@ def notify_backend(callback_url, status, error_message=None):
     try:
         parsed = urllib.parse.urlparse(callback_url)
         params = urllib.parse.parse_qs(parsed.query)
-        params['status'] = [status]
+        params["status"] = [status]
         if error_message:
-            params['error_message'] = [error_message]
+            params["error_message"] = [error_message]
         new_query = urllib.parse.urlencode(params, doseq=True)
-        webhook_url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+        webhook_url = urllib.parse.urlunparse(
+            (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
+        )
         print(f"Calling webhook: {webhook_url}")
         response = requests.post(webhook_url, timeout=30)
         response.raise_for_status()
@@ -90,27 +96,27 @@ def handler(event):
     job_input = event.get("input", {})
     melody_url = job_input.get("melody_url")
     melody_base64 = job_input.get("melody_base64")
-    prompt = job_input.get("prompt")
+    prompt = job_input.get("prompt")          # single description, like 'happy rock'
     duration = job_input.get("duration", 30)
     callback_url = job_input.get("callback_url")
     upload_urls = job_input.get("upload_urls", {})
     sample_rate = job_input.get("sample_rate", 32000)
-    
+
     if not melody_url and not melody_base64:
         error_msg = "Missing melody_url or melody_base64"
         if callback_url:
             notify_backend(callback_url, "failed", error_msg)
         return {"error": error_msg}
-    
+
     if not prompt:
         error_msg = "Missing prompt"
         if callback_url:
             notify_backend(callback_url, "failed", error_msg)
         return {"error": error_msg}
-    
+
     try:
         print(f"🎵 Melody continuation: '{prompt}', duration={duration}s")
-        
+
         # Load melody audio
         if melody_base64:
             melody_bytes = base64.b64decode(melody_base64)
@@ -119,55 +125,64 @@ def handler(event):
             resp = requests.get(melody_url, timeout=60)
             resp.raise_for_status()
             melody, sr = torchaudio.load(BytesIO(resp.content))
-        
-        # Ensure mono
+
+        # Ensure shape: (1, T) for melody model example
         if melody.shape[0] > 1:
             melody = torch.mean(melody, dim=0, keepdim=True)
-        melody_batch = melody[None]
-        
-        # Generate continuation
+        melody_batch = melody[None]  # (1, 1, T)
+
+        # Generate continuation with chroma conditioning (exact API from docs) [web:21]
         model.set_generation_params(duration=duration)
         wavs = model.generate_with_chroma([prompt], melody_batch, sr)
         one_wav = wavs[0]
-        
-        # Save with loudness normalization
-        buffer = BytesIO()
-        audio_write("temp", one_wav.cpu(), model.sample_rate, buffer, strategy="loudness")
-        raw_wav_bytes = buffer.getvalue()
-        
+
+        # Use audio_write exactly like the example: write to temp path, then read [web:21]
+        temp_path = "/tmp/mg_cont"
+        audio_write(f"{temp_path}", one_wav.cpu(), model.sample_rate, strategy="loudness")
+        wav_file_path = temp_path + ".wav"
+
+        with open(wav_file_path, "rb") as f:
+            raw_wav_bytes = f.read()
+
         final_wav_bytes = raw_wav_bytes
         if sample_rate == 48000:
             final_wav_bytes = upsample_audio(raw_wav_bytes)
-        
+
         result = {
-            "audio_base64_0": base64.b64encode(final_wav_bytes).decode('utf-8'),
+            "audio_base64_0": base64.b64encode(final_wav_bytes).decode("utf-8"),
             "sample_rate": sample_rate,
             "format": "wav"
         }
-        
-        # Upload if URL provided
+
+        # Optional upload
         if upload_urls and upload_urls.get("wav_url_0"):
-            upload_success = upload_to_gcs(upload_urls["wav_url_0"], final_wav_bytes)
-            if upload_success:
+            if upload_to_gcs(upload_urls["wav_url_0"], final_wav_bytes):
                 result["wav_url_0"] = upload_urls["wav_url_0"]
-        
+
         print("Generated continuation")
-        
+
         if callback_url:
             notify_backend(callback_url, "completed")
-        
+
+        # Clean temp
+        try:
+            if os.path.exists(wav_file_path):
+                os.remove(wav_file_path)
+        except Exception:
+            pass
+
         return {
             "status": "completed",
             "result": result,
             "duration": duration,
             "prompt": prompt
         }
-        
-    except Exception as e:
+
+    except Exception:
         error_msg = traceback.format_exc()
-        print(f"❌ Error: {error_msg}")
+        print(f"Error: {error_msg}")
         if callback_url:
-            notify_backend(callback_url, "failed", str(e))
+            notify_backend(callback_url, "failed", error_msg)
         return {"error": error_msg, "status": "failed"}
 
 # --- Start Serverless Worker ---
